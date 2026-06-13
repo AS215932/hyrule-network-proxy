@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,7 +26,10 @@ type Client struct {
 }
 
 func NewClient(cfg config.Config) (*Client, error) {
-	direct := &http.Client{Timeout: cfg.MaxTimeout}
+	direct := &http.Client{
+		Transport: &http.Transport{DialContext: newGuardedDialer(contract.ProxyModeDirect).DialContext},
+		Timeout:   cfg.MaxTimeout,
+	}
 	direct.CheckRedirect = policy.RedirectPolicy(contract.ProxyModeDirect, cfg.MaxRedirects, policy.DefaultResolver)
 
 	torTransport, err := torRoundTripper(cfg.TorSOCKSAddr)
@@ -47,7 +49,10 @@ func NewClient(cfg config.Config) (*Client, error) {
 	}
 	i2p.CheckRedirect = policy.RedirectPolicy(contract.ProxyModeI2P, cfg.MaxRedirects, policy.DefaultResolver)
 
-	ygg := &http.Client{Timeout: cfg.MaxTimeout}
+	ygg := &http.Client{
+		Transport: &http.Transport{DialContext: newGuardedDialer(contract.ProxyModeYggdrasil).DialContext},
+		Timeout:   cfg.MaxTimeout,
+	}
 	ygg.CheckRedirect = policy.RedirectPolicy(contract.ProxyModeYggdrasil, cfg.MaxRedirects, policy.DefaultResolver)
 
 	return &Client{cfg: cfg, directHTTP: direct, torHTTP: tor, i2pHTTP: i2p, yggHTTP: ygg}, nil
@@ -62,11 +67,8 @@ func torRoundTripper(addr string) (http.RoundTripper, error) {
 	if !ok {
 		return nil, errors.New("SOCKS5 dialer does not implement ContextDialer")
 	}
-	return &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return ctxDialer.DialContext(ctx, network, address)
-		},
-	}, nil
+	guarded := &guardedSOCKSDialer{mode: contract.ProxyModeTor, socks: ctxDialer}
+	return &http.Transport{DialContext: guarded.DialContext}, nil
 }
 
 func (c *Client) Do(ctx context.Context, in contract.NetworkRequest) contract.NetworkResponse {

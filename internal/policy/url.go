@@ -13,6 +13,8 @@ import (
 
 var ErrPolicyDenied = errors.New("policy denied")
 
+const MaxURLLength = 2048
+
 var AllowedMethods = map[string]struct{}{
 	"GET":  {},
 	"HEAD": {},
@@ -31,6 +33,9 @@ func NormalizeMethod(method string) (string, error) {
 }
 
 func ParseAndValidateURL(raw string, mode string) (*url.URL, error) {
+	if len(raw) > MaxURLLength {
+		return nil, fmt.Errorf("URL exceeds %d byte limit", MaxURLLength)
+	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
