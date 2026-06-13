@@ -1,0 +1,24 @@
+[Unit]
+Description=Hyrule Network Proxy
+After=network-online.target tor.service i2pd.service yggdrasil.service
+Wants=network-online.target tor.service i2pd.service yggdrasil.service
+
+[Service]
+Type=exec
+User=hyrule-netproxy
+Group=hyrule-netproxy
+EnvironmentFile=/etc/hyrule-network-proxy/env
+ExecStart=/usr/local/bin/hyrule-network-proxy
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hyrule-network-proxy
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hyrule-network-proxy
+
+[Install]
+WantedBy=multi-user.target
