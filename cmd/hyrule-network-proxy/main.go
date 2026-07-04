@@ -24,6 +24,7 @@ func main() {
 		slog.Error("config_load_failed", "error", err.Error())
 		os.Exit(1)
 	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: config.ParseLogLevel(cfg.LogLevel)})))
 
 	client, err := transport.NewClient(cfg)
 	if err != nil {

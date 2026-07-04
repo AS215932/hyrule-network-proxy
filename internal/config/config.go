@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -53,6 +55,21 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("invalid timeout settings")
 	}
 	return cfg, nil
+}
+
+// ParseLogLevel maps an HNP_LOG_LEVEL string to a slog.Level, defaulting to
+// info for empty or unrecognized values.
+func ParseLogLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func getenv(key, fallback string) string {

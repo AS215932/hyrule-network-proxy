@@ -30,6 +30,6 @@ func (s *Server) MetricsRouter() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
-	mux.Handle("/metrics", metrics.Handler(s.metrics.Registry))
+	mux.Handle("GET /metrics", metrics.Handler(s.metrics.Registry))
 	return mux
 }
