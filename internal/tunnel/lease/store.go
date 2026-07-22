@@ -139,6 +139,13 @@ func (s *Store) Create(p CreateParams) (Lease, error) {
 	if existing, ok := s.byID[p.LeaseID]; ok {
 		return *existing, nil
 	}
+	// Fail closed: reject a malformed allowlist rather than allocate a lease
+	// whose restriction silently parses to nothing.
+	for _, c := range p.AllowlistCIDRs {
+		if _, _, err := net.ParseCIDR(c); err != nil {
+			return Lease{}, fmt.Errorf("%w: %q", ErrInvalidCIDR, c)
+		}
+	}
 	port, err := s.alloc.allocate()
 	if err != nil {
 		return Lease{}, err
@@ -167,7 +174,10 @@ func (s *Store) Create(p CreateParams) (Lease, error) {
 	return *l, nil
 }
 
-// Extend pushes a lease's expiry out by d and returns the new expiry.
+// Extend pushes a lease's expiry out by d and returns the new expiry. The new
+// expiry is persisted BEFORE the in-memory copy is mutated, so a persistence
+// failure leaves SSH auth and the sweeper honoring the old (paid-for) expiry
+// rather than granting unbilled extra time until restart.
 func (s *Store) Extend(id string, d time.Duration) (Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,10 +185,12 @@ func (s *Store) Extend(id string, d time.Duration) (Lease, error) {
 	if !ok {
 		return Lease{}, ErrNotFound
 	}
-	l.ExpiresAt = l.ExpiresAt.Add(d)
-	if err := s.persist(l); err != nil {
+	updated := *l
+	updated.ExpiresAt = l.ExpiresAt.Add(d)
+	if err := s.persist(&updated); err != nil {
 		return Lease{}, err
 	}
+	l.ExpiresAt = updated.ExpiresAt
 	return *l, nil
 }
 
@@ -196,24 +208,31 @@ func (s *Store) MarkExpired(id string) error {
 	return s.remove(id, StatusExpired)
 }
 
-// remove deletes a lease from the indexes and bbolt and releases its port.
-// The status arg is advisory (logged by the caller); the row is deleted either
-// way since the daemon keeps only live leases.
+// remove deletes a lease from bbolt FIRST, then from the in-memory indexes and
+// the port allocator. Deleting the persisted row before releasing the port
+// prevents a later create from reusing the port while the old row is still on
+// disk (which would rehydrate two leases on one port after a restart). On a
+// bbolt failure the in-memory state is left intact so nothing is lost.
+// The status arg is advisory; the row is deleted either way since the daemon
+// keeps only live leases.
 func (s *Store) remove(id, _ string) error {
 	l, ok := s.byID[id]
 	if !ok {
 		return ErrNotFound
 	}
-	delete(s.byID, id)
-	delete(s.byToken, l.Token)
-	s.alloc.release(l.AllocatedPort)
-	return s.db.Update(func(tx *bolt.Tx) error {
+	if err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		if b == nil {
 			return nil
 		}
 		return b.Delete([]byte(id))
-	})
+	}); err != nil {
+		return err
+	}
+	delete(s.byID, id)
+	delete(s.byToken, l.Token)
+	s.alloc.release(l.AllocatedPort)
+	return nil
 }
 
 // Get returns a lease by id.
@@ -302,3 +321,6 @@ var ErrNotFound = fmt.Errorf("lease not found")
 
 // ErrPortsExhausted is returned when the data-port range has no free port.
 var ErrPortsExhausted = fmt.Errorf("no free data ports")
+
+// ErrInvalidCIDR is returned when a lease allowlist entry is not a valid CIDR.
+var ErrInvalidCIDR = fmt.Errorf("invalid allowlist CIDR")

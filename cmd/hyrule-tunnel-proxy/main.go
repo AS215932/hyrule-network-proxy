@@ -39,6 +39,14 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: nconfig.ParseLogLevel(cfg.LogLevel)}))
 	slog.SetDefault(log)
 
+	// Create the state dir before opening the DB: bbolt.Open creates the file
+	// but not its parent, and the systemd unit's ReadWritePaths grants access
+	// without creating the directory, so a fresh install would otherwise fail to
+	// start.
+	if err := os.MkdirAll(cfg.StateDir, 0o750); err != nil {
+		slog.Error("state_dir_create_failed", "dir", cfg.StateDir, "error", err.Error())
+		os.Exit(1)
+	}
 	store, err := lease.Open(filepath.Join(cfg.StateDir, "leases.db"), cfg.DataPortMin, cfg.DataPortMax)
 	if err != nil {
 		slog.Error("lease_store_open_failed", "error", err.Error())
@@ -82,8 +90,12 @@ func main() {
 		}
 	}()
 	go func() {
+		// A STUN bind failure is fatal, like the SSH intake: a configured public
+		// port that cannot bind is a deploy error that must surface to health
+		// checks rather than leave the advertised STUN service silently down.
 		if err := stunResponder.ListenAndServe(ctx); err != nil {
-			slog.Warn("stun_responder_failed", "error", err.Error())
+			slog.Error("stun_responder_failed", "error", err.Error())
+			stop()
 		}
 	}()
 	go runSweeper(ctx, coord)

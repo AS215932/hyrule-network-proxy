@@ -30,17 +30,20 @@ type forward struct {
 	listener      net.Listener
 	connectedAddr string
 	connectedPort uint32
-	allowNets     []*net.IPNet // empty => open to all
+	allowNets     []*net.IPNet // empty + !allowlistSet => open to all
+	allowlistSet  bool         // a restriction was requested for this lease
 	visitors      atomic.Int64
 	bytesIn       atomic.Int64
 	bytesOut      atomic.Int64
 	closeOnce     sync.Once
 }
 
-// allows reports whether a visitor source IP may connect.
+// allows reports whether a visitor source IP may connect. It fails CLOSED: if a
+// lease requested an allowlist but it parsed to zero usable networks, no visitor
+// is allowed, so a typo'd restriction never silently opens the port to everyone.
 func (f *forward) allows(ip net.IP) bool {
 	if len(f.allowNets) == 0 {
-		return true
+		return !f.allowlistSet
 	}
 	for _, n := range f.allowNets {
 		if n.Contains(ip) {
@@ -54,6 +57,21 @@ func (f *forward) close() {
 	f.closeOnce.Do(func() {
 		_ = f.listener.Close()
 	})
+}
+
+// reserveVisitorSlot atomically reserves a visitor slot if the current count is
+// below max, returning whether a slot was taken. The caller must Add(-1) on
+// release.
+func (f *forward) reserveVisitorSlot(max int64) bool {
+	for {
+		cur := f.visitors.Load()
+		if cur >= max {
+			return false
+		}
+		if f.visitors.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
 }
 
 // Manager owns the set of active forwards, one per lease. It enforces
@@ -91,19 +109,26 @@ func NewManager(store LeaseLookup, m *metrics.Metrics, log *slog.Logger, maxVisi
 
 // StartForward binds the lease's allocated public port and begins delivering
 // visitor connections to conn. Any pre-existing forward for the lease (an older
-// connection) is torn down first.
+// connection) is torn down FIRST so its listener releases the port before we
+// rebind — otherwise a reconnect would hit "address already in use" and the
+// advertised last-writer-wins takeover would never happen.
 func (m *Manager) StartForward(conn *gossh.ServerConn, l lease.Lease, bindAddr string, connectedPort uint32) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", l.AllocatedPort))
-	if err != nil {
-		return fmt.Errorf("bind data port %d: %w", l.AllocatedPort, err)
-	}
-
+	// Remove and close any existing forward for this lease under the lock, then
+	// close the old listener/conn before binding the replacement.
 	m.mu.Lock()
-	if old := m.forwards[l.LeaseID]; old != nil {
+	old := m.forwards[l.LeaseID]
+	delete(m.forwards, l.LeaseID)
+	m.mu.Unlock()
+	if old != nil {
 		old.close()
 		if old.conn != conn {
 			_ = old.conn.Close()
 		}
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", l.AllocatedPort))
+	if err != nil {
+		return fmt.Errorf("bind data port %d: %w", l.AllocatedPort, err)
 	}
 	f := &forward{
 		leaseID:       l.LeaseID,
@@ -112,7 +137,10 @@ func (m *Manager) StartForward(conn *gossh.ServerConn, l lease.Lease, bindAddr s
 		connectedAddr: bindAddr,
 		connectedPort: connectedPort,
 		allowNets:     parseCIDRs(l.AllowlistCIDRs),
+		allowlistSet:  len(l.AllowlistCIDRs) > 0,
 	}
+
+	m.mu.Lock()
 	m.forwards[l.LeaseID] = f
 	m.mu.Unlock()
 
@@ -121,7 +149,9 @@ func (m *Manager) StartForward(conn *gossh.ServerConn, l lease.Lease, bindAddr s
 	return nil
 }
 
-// Teardown closes and forgets a lease's forward, if any.
+// Teardown closes and forgets a lease's forward, if any, AND closes the client's
+// SSH connection so a revoked/expired lease cannot resend tcpip-forward to
+// recreate the listener.
 func (m *Manager) Teardown(leaseID string) {
 	m.mu.Lock()
 	f := m.forwards[leaseID]
@@ -129,6 +159,7 @@ func (m *Manager) Teardown(leaseID string) {
 	m.mu.Unlock()
 	if f != nil {
 		f.close()
+		_ = f.conn.Close()
 		m.log.Info("forward_torn_down", "lease_id", leaseID)
 	}
 }
@@ -186,10 +217,12 @@ func (m *Manager) handleVisitor(f *forward, vc net.Conn) {
 	if ip != nil && !f.allows(ip) {
 		return
 	}
-	if f.visitors.Load() >= int64(m.maxVisitors) {
+	// Reserve a visitor slot atomically. A plain load-then-increment lets a
+	// concurrent burst blow past the cap; a CAS loop makes check-and-reserve a
+	// single operation.
+	if !f.reserveVisitorSlot(int64(m.maxVisitors)) {
 		return
 	}
-	f.visitors.Add(1)
 	m.metrics.VisitorConnections.Inc()
 	defer func() {
 		f.visitors.Add(-1)

@@ -142,6 +142,41 @@ func TestExpiredBeforeAndMarkExpired(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsMalformedAllowlist(t *testing.T) {
+	s := newTestStore(t, 20200, 20210)
+	_, err := s.Create(CreateParams{
+		LeaseID:        "bad",
+		Duration:       time.Hour,
+		AllowlistCIDRs: []string{"not-a-cidr"},
+	})
+	if err == nil {
+		t.Fatalf("expected create to fail closed on a malformed CIDR")
+	}
+	// A malformed allowlist must not have consumed a port.
+	_, free := s.Stats()
+	if free != 11 {
+		t.Fatalf("expected all 11 ports free after rejected create, got %d", free)
+	}
+}
+
+func TestExtendPersistsBeforeMutating(t *testing.T) {
+	s := newTestStore(t, 20220, 20230)
+	l, _ := s.Create(CreateParams{LeaseID: "e", Duration: time.Hour})
+	orig := l.ExpiresAt
+	got, err := s.Extend("e", time.Hour)
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	if !got.ExpiresAt.After(orig) {
+		t.Fatalf("expiry not advanced")
+	}
+	// In-memory (auth-path) view reflects the persisted expiry.
+	live, _ := s.ByToken(l.Token)
+	if !live.ExpiresAt.Equal(got.ExpiresAt) {
+		t.Fatalf("in-memory expiry %v != returned %v", live.ExpiresAt, got.ExpiresAt)
+	}
+}
+
 func TestAllowsIP(t *testing.T) {
 	open := Lease{}
 	if !open.AllowsIP(net.ParseIP("203.0.113.5")) {

@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -78,6 +79,16 @@ func Load() (Config, error) {
 	if cfg.EndpointHost == "" {
 		return cfg, fmt.Errorf("HTP_ENDPOINT_HOST is required")
 	}
+	// The control API is the bearer-gated money path and the metrics endpoint is
+	// unauthenticated; both must stay internal. Reject a wildcard bind so a
+	// production misconfiguration can never expose them on every interface. (The
+	// SSH and STUN listeners are intentionally public and are not checked.)
+	if isWildcardAddr(cfg.ControlListenAddr) {
+		return cfg, fmt.Errorf("HTP_CONTROL_LISTEN_ADDR must bind an internal address, not a wildcard: %q", cfg.ControlListenAddr)
+	}
+	if isWildcardAddr(cfg.MetricsListenAddr) {
+		return cfg, fmt.Errorf("HTP_METRICS_LISTEN_ADDR must bind an internal address, not a wildcard: %q", cfg.MetricsListenAddr)
+	}
 	if cfg.MinLeaseSeconds <= 0 || cfg.MaxLeaseSeconds < cfg.MinLeaseSeconds {
 		return cfg, fmt.Errorf("invalid lease duration bounds")
 	}
@@ -88,6 +99,21 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("invalid auth rate-limit settings")
 	}
 	return cfg, nil
+}
+
+// isWildcardAddr reports whether a host:port address binds all interfaces, i.e.
+// the host is empty (":8452"), "0.0.0.0", or "::".
+func isWildcardAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Unparseable — treat as unsafe so a malformed internal addr is rejected.
+		return true
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return true
+	}
+	return net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified()
 }
 
 // parsePortRange parses "10000-10499" into inclusive [min, max] bounds.

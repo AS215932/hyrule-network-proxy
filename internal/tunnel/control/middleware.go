@@ -16,13 +16,16 @@ func (a *API) withAuth(op string, next http.HandlerFunc) http.HandlerFunc {
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if !strings.HasPrefix(auth, prefix) {
-			http.Error(rec, "unauthorized", http.StatusUnauthorized)
+			// Use the JSON ErrorResponse envelope like every other control
+			// failure, so a client that uniformly decodes control errors as JSON
+			// doesn't itself break while handling a 401.
+			writeError(rec, http.StatusUnauthorized, "unauthorized")
 			a.record(op, rec.status)
 			return
 		}
 		token := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
 		if subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) != 1 {
-			http.Error(rec, "unauthorized", http.StatusUnauthorized)
+			writeError(rec, http.StatusUnauthorized, "unauthorized")
 			a.record(op, rec.status)
 			return
 		}

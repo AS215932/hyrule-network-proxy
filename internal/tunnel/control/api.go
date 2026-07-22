@@ -73,6 +73,10 @@ func (a *API) handleCreate(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "no free tunnel ports")
 			return
 		}
+		if errors.Is(err, lease.ErrInvalidCIDR) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		a.log.Error("create_lease_failed", "lease_id", req.LeaseID, "error", err.Error())
 		writeError(w, http.StatusInternalServerError, "create failed")
 		return

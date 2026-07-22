@@ -89,11 +89,12 @@ func (s *Server) serverConfig() *gossh.ServerConfig {
 		return &gossh.Permissions{Extensions: map[string]string{"lease_id": l.LeaseID}}, nil
 	}
 	cfg := &gossh.ServerConfig{
+		// Token-only: the username is the lease token, authenticated via the
+		// guarded "none" method so rescue clients (which have no key) connect
+		// without a prompt. Password auth is deliberately NOT offered — it must
+		// not be an enabled protocol method.
 		NoClientAuth: true,
 		NoClientAuthCallback: func(conn gossh.ConnMetadata) (*gossh.Permissions, error) {
-			return authByToken(conn)
-		},
-		PasswordCallback: func(conn gossh.ConnMetadata, _ []byte) (*gossh.Permissions, error) {
 			return authByToken(conn)
 		},
 		ServerVersion: "SSH-2.0-hyrule-tunnel",
@@ -120,6 +121,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		_ = ln.Close()
 	}()
 	s.log.Info("ssh_intake_listening", "addr", ln.Addr().String(), "fingerprint", s.HostKeyFingerprint())
+	const maxAcceptBackoff = time.Second
+	var acceptBackoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -127,10 +130,27 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				s.log.Warn("ssh_accept_error", "error", err.Error())
-				continue
 			}
+			// A persistent resource error (e.g. EMFILE at the fd limit) would
+			// otherwise spin a tight CPU + journal-flooding loop. Back off with a
+			// bounded exponential delay so the daemon recovers as descriptors free.
+			if acceptBackoff == 0 {
+				acceptBackoff = 5 * time.Millisecond
+			} else {
+				acceptBackoff *= 2
+				if acceptBackoff > maxAcceptBackoff {
+					acceptBackoff = maxAcceptBackoff
+				}
+			}
+			s.log.Warn("ssh_accept_error", "error", err.Error(), "backoff", acceptBackoff.String())
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(acceptBackoff):
+			}
+			continue
 		}
+		acceptBackoff = 0
 		host := remoteIP(conn.RemoteAddr())
 		if !s.limiter.allow(host) {
 			s.metrics.SSHAuthFailures.Inc()
@@ -189,6 +209,18 @@ func (s *Server) handleGlobalRequests(sconn *gossh.ServerConn, reqs <-chan *goss
 				replyRequest(req, false, nil)
 				continue
 			}
+			// Re-validate the lease on every forward request. A session
+			// authenticated before its lease expired or was revoked must not be
+			// able to (re)create a public listener afterwards — the cached auth-
+			// time lease is not trusted here. Re-fetch and check expiry; refuse
+			// (and close the connection) if the lease is gone or expired.
+			fresh, ok := s.store.Get(l.LeaseID)
+			if !ok || fresh.Expired(time.Now()) {
+				replyRequest(req, false, nil)
+				_ = sconn.Close()
+				return
+			}
+			l = fresh
 			// Ignore the client's requested port; always bind the lease's
 			// allocated port. Echo the client's requested bind in the eventual
 			// forwarded-tcpip channel so OpenSSH's permit-open check matches:

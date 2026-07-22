@@ -142,6 +142,40 @@ func TestSessionChannelRejected(t *testing.T) {
 	}
 }
 
+func TestForwardRefusedAfterLeaseExpires(t *testing.T) {
+	// A session authenticated before its lease expired must not be able to open a
+	// public listener afterwards (per-forward revalidation).
+	store, addr := testHarness(t)
+	l, _ := store.Create(lease.CreateParams{LeaseID: "expmid", Duration: time.Hour})
+	client, err := dialClient(t, addr, l.Token)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	// Expire the lease after auth but before the forward request.
+	if _, err := store.Extend("expmid", -2*time.Hour); err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	if fwd, err := client.ListenTCP(&net.TCPAddr{IP: net.IPv4zero, Port: 0}); err == nil {
+		fwd.Close()
+		t.Fatalf("remote forward must be refused once the lease has expired")
+	}
+}
+
+func TestForwardAllowsFailsClosed(t *testing.T) {
+	// A lease that requested an allowlist which parsed to zero usable networks
+	// must deny every visitor, never fall open.
+	f := &forward{allowlistSet: true}
+	if f.allows(net.ParseIP("203.0.113.9")) {
+		t.Fatalf("empty-but-configured allowlist must fail closed")
+	}
+	open := &forward{allowlistSet: false}
+	if !open.allows(net.ParseIP("203.0.113.9")) {
+		t.Fatalf("no allowlist must allow all")
+	}
+}
+
 func TestInvalidTokenRejected(t *testing.T) {
 	_, addr := testHarness(t)
 	if client, err := dialClient(t, addr, "definitely-not-a-valid-token"); err == nil {
