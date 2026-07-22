@@ -155,9 +155,11 @@ func decodeJSON(r io.Reader, out any) error {
 	if err := dec.Decode(out); err != nil {
 		return err
 	}
-	// Reject trailing data after the object so a concatenated/corrupted body
-	// can't slip a money-path operation through the strict decoder.
-	if dec.More() {
+	// Reject ANY trailing data after the object so a concatenated/corrupted body
+	// (e.g. `{...}]`) can't slip a money-path operation through. Decoder.More is
+	// not enough — it returns false before a closing `]`/`}` — so require the
+	// next token to be io.EOF.
+	if err := dec.Decode(&json.RawMessage{}); err != io.EOF {
 		return fmt.Errorf("unexpected trailing data after JSON object")
 	}
 	return nil

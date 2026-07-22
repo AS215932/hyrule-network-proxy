@@ -135,6 +135,24 @@ func TestControlNotFoundPaths(t *testing.T) {
 	}
 }
 
+func TestControlRejectsTrailingJSON(t *testing.T) {
+	h := testAPI(t)
+	// Valid object followed by trailing data must be rejected, not executed.
+	for _, body := range []string{
+		`{"lease_id":"x","duration_seconds":3600}]`,
+		`{"lease_id":"x","duration_seconds":3600}{"lease_id":"y","duration_seconds":3600}`,
+		`{"lease_id":"x","duration_seconds":3600} garbage`,
+	} {
+		req := httptest.NewRequest("POST", "/v1/leases", bytes.NewReader([]byte(body)))
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("trailing data %q: want 400, got %d", body, rec.Code)
+		}
+	}
+}
+
 func TestControlLifecycle(t *testing.T) {
 	h := testAPI(t)
 	do(t, h, "POST", "/v1/leases", "secret", contract.CreateLeaseRequest{LeaseID: "x", DurationSeconds: 3600})

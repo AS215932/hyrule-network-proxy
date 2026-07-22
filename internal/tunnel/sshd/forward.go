@@ -33,6 +33,13 @@ type forward struct {
 	allowNets     []*net.IPNet // empty + !allowlistSet => open to all
 	allowlistSet  bool         // a restriction was requested for this lease
 	closeOnce     sync.Once
+
+	// Active visitor sockets, closed on teardown so a blocked visitor→channel
+	// copy unblocks (otherwise wg.Wait and the visitor-count decrement never run
+	// and descriptors leak).
+	vmu      sync.Mutex
+	visitors map[net.Conn]struct{}
+	closed   bool
 }
 
 // allows reports whether a visitor source IP may connect. It fails CLOSED: if a
@@ -53,7 +60,37 @@ func (f *forward) allows(ip net.IP) bool {
 func (f *forward) close() {
 	f.closeOnce.Do(func() {
 		_ = f.listener.Close()
+		f.vmu.Lock()
+		f.closed = true
+		for vc := range f.visitors {
+			_ = vc.Close()
+		}
+		f.visitors = nil
+		f.vmu.Unlock()
 	})
+}
+
+// trackVisitor registers a visitor socket for teardown-time closure, returning
+// false if the forward is already closed (the caller should drop the socket).
+func (f *forward) trackVisitor(vc net.Conn) bool {
+	f.vmu.Lock()
+	defer f.vmu.Unlock()
+	if f.closed {
+		return false
+	}
+	if f.visitors == nil {
+		f.visitors = make(map[net.Conn]struct{})
+	}
+	f.visitors[vc] = struct{}{}
+	return true
+}
+
+func (f *forward) untrackVisitor(vc net.Conn) {
+	f.vmu.Lock()
+	if f.visitors != nil {
+		delete(f.visitors, vc)
+	}
+	f.vmu.Unlock()
 }
 
 // leaseState is the single authenticated connection for a lease plus its current
@@ -93,6 +130,20 @@ type Manager struct {
 	maxVisitors int
 }
 
+// visitorIP extracts a visitor's source IP, preferring the structured
+// *net.TCPAddr (so an IPv6 zone like %eth0 doesn't defeat parsing). Returns nil
+// if no IP can be determined — a restricted lease then rejects the visitor.
+func visitorIP(addr net.Addr) net.IP {
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.IP
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
+}
+
 // parseCIDRs parses lease allowlist entries, silently dropping malformed ones
 // (the cloud validates them before create, so this is defensive only).
 func parseCIDRs(cidrs []string) []*net.IPNet {
@@ -124,11 +175,18 @@ var (
 )
 
 // RegisterConn records the authenticated connection for a lease, last-writer-
-// wins: any prior connection (and its forward) for the lease is closed. This
-// bounds a lease to one live connection even if the client never forwards, and
-// makes every session closable by Teardown.
-func (m *Manager) RegisterConn(conn *gossh.ServerConn, leaseID string) {
+// wins: any prior connection (and its forward) for the lease is closed. It
+// re-validates the lease against the store under the same lock Teardown uses, so
+// a connection can't be registered for a lease that revocation/expiry already
+// tore down (which would leave an idle socket alive). Returns false if the lease
+// is gone/expired; the caller must then close the connection.
+func (m *Manager) RegisterConn(conn *gossh.ServerConn, leaseID string) bool {
 	m.mu.Lock()
+	l, ok := m.store.Get(leaseID)
+	if !ok || l.Expired(time.Now()) {
+		m.mu.Unlock()
+		return false
+	}
 	old := m.leases[leaseID]
 	m.leases[leaseID] = &leaseState{conn: conn}
 	m.mu.Unlock()
@@ -140,6 +198,7 @@ func (m *Manager) RegisterConn(conn *gossh.ServerConn, leaseID string) {
 			_ = old.conn.Close()
 		}
 	}
+	return true
 }
 
 // StartForward validates the lease and binds its allocated public port for the
@@ -241,11 +300,15 @@ func (m *Manager) OnConnClosed(leaseID string, conn *gossh.ServerConn) {
 func (m *Manager) Stats(leaseID string) (connected bool, visitors int, bytesIn, bytesOut int64) {
 	m.mu.Lock()
 	st := m.leases[leaseID]
-	m.mu.Unlock()
 	if st == nil {
+		m.mu.Unlock()
 		return false, 0, 0, 0
 	}
-	return st.forward != nil, int(st.visitors.Load()), st.bytesIn.Load(), st.bytesOut.Load()
+	// Read the forward pointer under the lock (StartForward/CancelForward write
+	// it under the same lock — reading it after unlocking would be a data race).
+	connected = st.forward != nil
+	m.mu.Unlock()
+	return connected, int(st.visitors.Load()), st.bytesIn.Load(), st.bytesOut.Load()
 }
 
 // acceptVisitors accepts public connections on the lease's data port and pipes
@@ -281,11 +344,21 @@ func (m *Manager) acceptVisitors(st *leaseState, f *forward) {
 func (m *Manager) handleVisitor(st *leaseState, f *forward, vc net.Conn) {
 	defer vc.Close()
 
-	ip := net.ParseIP(remoteIP(vc.RemoteAddr()))
-	if ip != nil && !f.allows(ip) {
-		return
+	// Fail closed on a restricted lease: use the address's IP directly and reject
+	// anything we can't resolve to an allowed IP (e.g. an IPv6 link-local peer
+	// with a zone like fe80::1%eth0 that net.ParseIP can't parse).
+	ip := visitorIP(vc.RemoteAddr())
+	if f.allowlistSet || len(f.allowNets) > 0 {
+		if ip == nil || !f.allows(ip) {
+			return
+		}
 	}
-	// Reserve a per-lease visitor slot atomically (survives forward generations).
+	// Track the socket so teardown can close it (unblocking both copy directions),
+	// and reserve a per-lease visitor slot atomically (survives forward gens).
+	if !f.trackVisitor(vc) {
+		return // forward already torn down
+	}
+	defer f.untrackVisitor(vc)
 	if !st.reserveVisitorSlot(int64(m.maxVisitors)) {
 		return
 	}

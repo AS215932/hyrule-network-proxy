@@ -184,8 +184,13 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 
 	// Register the connection (last-writer-wins). This bounds a lease to one live
 	// connection even if it never forwards, and makes the session closable by
-	// teardown — a token holder can't accumulate idle sockets.
-	s.manager.RegisterConn(sconn, leaseID)
+	// teardown — a token holder can't accumulate idle sockets. Registration
+	// re-validates the lease under the teardown lock; if it lost a race with
+	// revocation/expiry, refuse and close.
+	if !s.manager.RegisterConn(sconn, leaseID) {
+		_ = sconn.Close()
+		return
+	}
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

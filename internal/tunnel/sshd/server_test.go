@@ -231,6 +231,18 @@ func TestForwardAllowsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestVisitorIP(t *testing.T) {
+	// A TCPAddr with an IPv6 zone must still yield its IP (not defeat parsing).
+	zoned := &net.TCPAddr{IP: net.ParseIP("fe80::1"), Zone: "eth0", Port: 5}
+	if got := visitorIP(zoned); got == nil || !got.Equal(net.ParseIP("fe80::1")) {
+		t.Fatalf("zoned TCPAddr should yield fe80::1, got %v", got)
+	}
+	// An address with no usable IP yields nil (a restricted lease then rejects).
+	if visitorIP(&net.TCPAddr{IP: nil}) != nil {
+		t.Fatalf("nil-IP TCPAddr should yield nil")
+	}
+}
+
 func TestInvalidTokenRejected(t *testing.T) {
 	_, addr := testHarness(t)
 	if client, err := dialClient(t, addr, "definitely-not-a-valid-token"); err == nil {
