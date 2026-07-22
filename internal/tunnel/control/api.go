@@ -152,7 +152,15 @@ func decodeJSON(r io.Reader, out any) error {
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	return dec.Decode(out)
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	// Reject trailing data after the object so a concatenated/corrupted body
+	// can't slip a money-path operation through the strict decoder.
+	if dec.More() {
+		return fmt.Errorf("unexpected trailing data after JSON object")
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

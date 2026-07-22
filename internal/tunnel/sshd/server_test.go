@@ -163,6 +163,28 @@ func TestForwardRefusedAfterLeaseExpires(t *testing.T) {
 	}
 }
 
+func TestDuplicateForwardFromSameConnRefused(t *testing.T) {
+	// A second remote forward on the SAME connection must be refused (it would
+	// otherwise reset the visitor counter and bypass the per-lease cap).
+	store, addr := testHarness(t)
+	l, _ := store.Create(lease.CreateParams{LeaseID: "dup2", Duration: time.Hour})
+	client, err := dialClient(t, addr, l.Token)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	fwd, err := client.ListenTCP(&net.TCPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("first forward: %v", err)
+	}
+	defer fwd.Close()
+	if fwd2, err := client.ListenTCP(&net.TCPAddr{IP: net.IPv4zero, Port: 0}); err == nil {
+		fwd2.Close()
+		t.Fatalf("a duplicate forward on the same connection must be refused")
+	}
+}
+
 func TestForwardAllowsFailsClosed(t *testing.T) {
 	// A lease that requested an allowlist which parsed to zero usable networks
 	// must deny every visitor, never fall open.

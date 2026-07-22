@@ -1,6 +1,7 @@
 package sshd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -8,8 +9,8 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/AS215932/hyrule-network-proxy/internal/tunnel/lease"
 	"github.com/AS215932/hyrule-network-proxy/internal/tunnel/metrics"
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -107,31 +108,54 @@ func NewManager(store LeaseLookup, m *metrics.Metrics, log *slog.Logger, maxVisi
 	}
 }
 
-// StartForward binds the lease's allocated public port and begins delivering
-// visitor connections to conn. Any pre-existing forward for the lease (an older
-// connection) is torn down FIRST so its listener releases the port before we
-// rebind — otherwise a reconnect would hit "address already in use" and the
-// advertised last-writer-wins takeover would never happen.
-func (m *Manager) StartForward(conn *gossh.ServerConn, l lease.Lease, bindAddr string, connectedPort uint32) error {
-	// Remove and close any existing forward for this lease under the lock, then
-	// close the old listener/conn before binding the replacement.
+// ErrLeaseGone means the lease was revoked/expired between authentication and
+// this forward request. ErrDuplicateForward means the same connection already
+// has an active forward for the lease.
+var (
+	ErrLeaseGone        = fmt.Errorf("lease no longer active")
+	ErrDuplicateForward = fmt.Errorf("connection already has an active forward")
+)
+
+// StartForward validates the lease, binds its allocated public port, and begins
+// delivering visitor connections to conn. The entire critical section — lease
+// re-validation against the store, replacing any prior forward, binding, and
+// registration — runs under a single lock hold, and Teardown holds the same
+// lock, so activation is serialized with revocation: once the coordinator has
+// removed the lease from the store (which it does BEFORE calling Teardown), no
+// StartForward can install a listener for it. Returns the assigned public port
+// and the connected-port to echo in forwarded-tcpip channels.
+func (m *Manager) StartForward(conn *gossh.ServerConn, leaseID, bindAddr string, requestedPort uint32) (assignedPort int, connectedPort uint32, err error) {
 	m.mu.Lock()
-	old := m.forwards[l.LeaseID]
-	delete(m.forwards, l.LeaseID)
-	m.mu.Unlock()
-	if old != nil {
-		old.close()
-		if old.conn != conn {
-			_ = old.conn.Close()
+	defer m.mu.Unlock()
+
+	l, ok := m.store.Get(leaseID)
+	if !ok || l.Expired(time.Now()) {
+		return 0, 0, ErrLeaseGone
+	}
+
+	if old := m.forwards[leaseID]; old != nil {
+		if old.conn == conn {
+			// Same connection re-requesting: refuse rather than reset the visitor
+			// counter / leak the prior forward's live channels past the cap.
+			return 0, 0, ErrDuplicateForward
 		}
+		// Reconnect from a new connection: last-writer-wins takeover. Close the
+		// old listener + conn before rebinding so the port is free.
+		old.close()
+		_ = old.conn.Close()
+		delete(m.forwards, leaseID)
 	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", l.AllocatedPort))
 	if err != nil {
-		return fmt.Errorf("bind data port %d: %w", l.AllocatedPort, err)
+		return 0, 0, fmt.Errorf("bind data port %d: %w", l.AllocatedPort, err)
+	}
+	connectedPort = requestedPort
+	if requestedPort == 0 {
+		connectedPort = uint32(l.AllocatedPort)
 	}
 	f := &forward{
-		leaseID:       l.LeaseID,
+		leaseID:       leaseID,
 		conn:          conn,
 		listener:      ln,
 		connectedAddr: bindAddr,
@@ -139,14 +163,10 @@ func (m *Manager) StartForward(conn *gossh.ServerConn, l lease.Lease, bindAddr s
 		allowNets:     parseCIDRs(l.AllowlistCIDRs),
 		allowlistSet:  len(l.AllowlistCIDRs) > 0,
 	}
-
-	m.mu.Lock()
-	m.forwards[l.LeaseID] = f
-	m.mu.Unlock()
-
-	m.log.Info("forward_started", "lease_id", l.LeaseID, "port", l.AllocatedPort)
+	m.forwards[leaseID] = f
+	m.log.Info("forward_started", "lease_id", leaseID, "port", l.AllocatedPort)
 	go m.acceptVisitors(f)
-	return nil
+	return l.AllocatedPort, connectedPort, nil
 }
 
 // Teardown closes and forgets a lease's forward, if any, AND closes the client's
@@ -162,6 +182,21 @@ func (m *Manager) Teardown(leaseID string) {
 		_ = f.conn.Close()
 		m.log.Info("forward_torn_down", "lease_id", leaseID)
 	}
+}
+
+// CancelForward tears down a lease's forward only if it belongs to conn, so a
+// stale cancel-tcpip-forward from an older/secondary connection cannot close the
+// listener a newer connection just installed.
+func (m *Manager) CancelForward(leaseID string, conn *gossh.ServerConn) {
+	m.mu.Lock()
+	f := m.forwards[leaseID]
+	if f == nil || f.conn != conn {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.forwards, leaseID)
+	m.mu.Unlock()
+	f.close()
 }
 
 // OnConnClosed tears down a lease's forward only if it still belongs to conn,
@@ -199,13 +234,32 @@ func (m *Manager) Stats(leaseID string) (connected bool, visitors int, bytesIn, 
 }
 
 // acceptVisitors accepts public connections on the lease's data port and pipes
-// each one over a forwarded-tcpip channel to the client.
+// each one over a forwarded-tcpip channel to the client. A transient accept
+// error (e.g. EMFILE at the fd limit) is retried with bounded backoff rather
+// than permanently stopping the forward; the loop exits only when the listener
+// is closed (teardown).
 func (m *Manager) acceptVisitors(f *forward) {
+	const maxBackoff = time.Second
+	var backoff time.Duration
 	for {
 		vc, err := f.listener.Accept()
 		if err != nil {
-			return // listener closed
+			if errors.Is(err, net.ErrClosed) {
+				return // listener closed by teardown
+			}
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			m.log.Warn("visitor_accept_error", "lease_id", f.leaseID, "error", err.Error(), "backoff", backoff.String())
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
 		go m.handleVisitor(f, vc)
 	}
 }

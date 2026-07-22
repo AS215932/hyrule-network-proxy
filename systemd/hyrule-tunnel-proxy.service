@@ -15,7 +15,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/hyrule-tunnel-proxy
+# systemd creates /var/lib/hyrule-tunnel-proxy owned by the service user before
+# the sandboxed (non-root, ProtectSystem=strict) process starts, and adds it to
+# the writable paths — so a fresh install has a writable state dir.
+StateDirectory=hyrule-tunnel-proxy
+StateDirectoryMode=0750
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hyrule-tunnel-proxy

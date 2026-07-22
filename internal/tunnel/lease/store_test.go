@@ -177,6 +177,27 @@ func TestExtendPersistsBeforeMutating(t *testing.T) {
 	}
 }
 
+func TestMarkExpiredIfBeforeSkipsRenewed(t *testing.T) {
+	s := newTestStore(t, 20240, 20250)
+	_, _ = s.Create(CreateParams{LeaseID: "r", Duration: time.Millisecond})
+	time.Sleep(5 * time.Millisecond)
+	cutoff := time.Now()
+	// A renewal lands after the sweep cutoff.
+	if _, err := s.Extend("r", time.Hour); err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	removed, err := s.MarkExpiredIfBefore("r", cutoff)
+	if err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if removed {
+		t.Fatalf("renewed lease must not be reaped by a stale-cutoff sweep")
+	}
+	if _, ok := s.Get("r"); !ok {
+		t.Fatalf("renewed lease should still exist")
+	}
+}
+
 func TestAllowsIP(t *testing.T) {
 	open := Lease{}
 	if !open.AllowsIP(net.ParseIP("203.0.113.5")) {

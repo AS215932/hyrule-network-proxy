@@ -208,6 +208,26 @@ func (s *Store) MarkExpired(id string) error {
 	return s.remove(id, StatusExpired)
 }
 
+// MarkExpiredIfBefore removes a lease only if it still expires at or before
+// cutoff, rechecked under the lock. Returns whether it was removed. This closes
+// the sweep race where an extension lands after the expired-IDs snapshot but
+// before deletion: the renewed lease is left intact instead of being clobbered.
+func (s *Store) MarkExpiredIfBefore(id string, cutoff time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, ok := s.byID[id]
+	if !ok {
+		return false, nil
+	}
+	if l.ExpiresAt.After(cutoff) {
+		return false, nil // renewed since the snapshot
+	}
+	if err := s.remove(id, StatusExpired); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // remove deletes a lease from bbolt FIRST, then from the in-memory indexes and
 // the port allocator. Deleting the persisted row before releasing the port
 // prevents a later create from reusing the port while the old row is still on

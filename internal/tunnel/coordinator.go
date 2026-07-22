@@ -60,12 +60,15 @@ func (c *Coordinator) ExtendLease(id string, req contract.ExtendLeaseRequest) (c
 	return c.toResponse(l, false), nil
 }
 
-// RevokeLease tears down the tunnel and deletes the lease.
+// RevokeLease deletes the lease from the store FIRST, then tears down the
+// forward. Removing it from the store before teardown means a concurrent
+// tcpip-forward (which re-checks the store under the manager lock in
+// StartForward) can no longer install a listener for the revoked lease.
 func (c *Coordinator) RevokeLease(id string) error {
-	c.manager.Teardown(id)
 	if err := c.store.Revoke(id); err != nil {
 		return err
 	}
+	c.manager.Teardown(id)
 	c.metrics.Reconcile.WithLabelValues("revoked").Inc()
 	c.RefreshMetrics()
 	return nil
@@ -104,18 +107,29 @@ func (c *Coordinator) Health() contract.HealthResponse {
 
 // SweepExpired tears down and deletes every lease past its expiry, returning the
 // number reaped. Belt-and-braces with the cloud worker, which also revokes.
+//
+// The store is updated BEFORE the forward is torn down so activation (which
+// re-checks the store under the manager lock) cannot race a listener back in
+// after teardown. Deletion is conditional on the lease still being expired at
+// the sweep cutoff, so an extension that lands between the snapshot and the
+// delete is not clobbered.
 func (c *Coordinator) SweepExpired() int {
-	ids := c.store.ExpiredBefore(time.Now())
+	cutoff := time.Now()
+	ids := c.store.ExpiredBefore(cutoff)
+	reaped := 0
 	for _, id := range ids {
-		c.manager.Teardown(id)
-		if err := c.store.MarkExpired(id); err == nil {
-			c.metrics.Reconcile.WithLabelValues("expired").Inc()
+		removed, err := c.store.MarkExpiredIfBefore(id, cutoff)
+		if err != nil || !removed {
+			continue // a renewal landed, or already gone — leave it be
 		}
+		c.manager.Teardown(id)
+		c.metrics.Reconcile.WithLabelValues("expired").Inc()
+		reaped++
 	}
-	if len(ids) > 0 {
+	if reaped > 0 {
 		c.RefreshMetrics()
 	}
-	return len(ids)
+	return reaped
 }
 
 // RefreshMetrics updates the lease/port gauges from store state.

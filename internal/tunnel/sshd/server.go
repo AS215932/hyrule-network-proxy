@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -209,40 +210,32 @@ func (s *Server) handleGlobalRequests(sconn *gossh.ServerConn, reqs <-chan *goss
 				replyRequest(req, false, nil)
 				continue
 			}
-			// Re-validate the lease on every forward request. A session
-			// authenticated before its lease expired or was revoked must not be
-			// able to (re)create a public listener afterwards — the cached auth-
-			// time lease is not trusted here. Re-fetch and check expiry; refuse
-			// (and close the connection) if the lease is gone or expired.
-			fresh, ok := s.store.Get(l.LeaseID)
-			if !ok || fresh.Expired(time.Now()) {
+			// StartForward re-validates the lease against the store under its lock
+			// (a session authenticated before its lease expired/was revoked must
+			// not be able to install a public listener) and binds the lease's
+			// allocated port, ignoring the client's requested port. On a gone/
+			// expired lease, refuse and close the connection.
+			assignedPort, _, err := s.manager.StartForward(sconn, l.LeaseID, m.Addr, m.Port)
+			if err != nil {
 				replyRequest(req, false, nil)
-				_ = sconn.Close()
-				return
-			}
-			l = fresh
-			// Ignore the client's requested port; always bind the lease's
-			// allocated port. Echo the client's requested bind in the eventual
-			// forwarded-tcpip channel so OpenSSH's permit-open check matches:
-			// for a dynamic (port 0) request that is the port we assign.
-			connectedPort := m.Port
-			if m.Port == 0 {
-				connectedPort = uint32(l.AllocatedPort)
-			}
-			if err := s.manager.StartForward(sconn, l, m.Addr, connectedPort); err != nil {
+				if errors.Is(err, ErrLeaseGone) {
+					_ = sconn.Close()
+					return
+				}
 				s.log.Warn("forward_start_failed", "lease_id", l.LeaseID, "error", err.Error())
-				replyRequest(req, false, nil)
 				continue
 			}
 			if req.WantReply {
 				if m.Port == 0 {
-					_ = req.Reply(true, gossh.Marshal(struct{ Port uint32 }{uint32(l.AllocatedPort)}))
+					_ = req.Reply(true, gossh.Marshal(struct{ Port uint32 }{uint32(assignedPort)}))
 				} else {
 					_ = req.Reply(true, nil)
 				}
 			}
 		case "cancel-tcpip-forward":
-			s.manager.Teardown(l.LeaseID)
+			// Scoped to this connection so a stale cancel can't drop a newer
+			// connection's forward.
+			s.manager.CancelForward(l.LeaseID, sconn)
 			replyRequest(req, true, nil)
 		default:
 			// keepalive@openssh.com and anything unexpected: decline.
@@ -274,8 +267,11 @@ func (s *Server) keepalive(ctx context.Context, sconn *gossh.ServerConn) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_, _, err := sconn.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil {
+			// SendRequest waits for the reply with no deadline; a blackholed NAT
+			// path (socket never closed) would block it forever and the three-
+			// miss reap would never fire. Bound each request so a stale binding
+			// is reaped predictably.
+			if err := s.sendKeepalive(sconn); err != nil {
 				misses++
 				if misses >= 3 {
 					_ = sconn.Close()
@@ -285,6 +281,22 @@ func (s *Server) keepalive(ctx context.Context, sconn *gossh.ServerConn) {
 			}
 			misses = 0
 		}
+	}
+}
+
+// sendKeepalive sends one keepalive and waits at most KeepaliveInterval for the
+// reply, returning an error on failure or timeout.
+func (s *Server) sendKeepalive(sconn *gossh.ServerConn) error {
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := sconn.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(s.cfg.KeepaliveInterval):
+		return fmt.Errorf("keepalive timed out")
 	}
 }
 
