@@ -182,6 +182,11 @@ func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
 	defer s.metrics.SSHConnections.WithLabelValues("connected").Dec()
 	s.log.Info("ssh_client_connected", "lease_id", leaseID, "port", l.AllocatedPort)
 
+	// Register the connection (last-writer-wins). This bounds a lease to one live
+	// connection even if it never forwards, and makes the session closable by
+	// teardown — a token holder can't accumulate idle sockets.
+	s.manager.RegisterConn(sconn, leaseID)
+
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go s.keepalive(connCtx, sconn)

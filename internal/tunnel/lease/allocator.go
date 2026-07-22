@@ -50,7 +50,10 @@ func (a *portAllocator) allocate() (int, error) {
 			continue
 		}
 		if portInUse(port) {
-			a.used[port] = true // avoid re-probing a foreign listener every allocate
+			// Skip for THIS allocation but do NOT cache the failure: the "busy"
+			// port may be our own listener mid-teardown (revoke releases the port
+			// before Teardown closes the listener). Permanently marking it used
+			// would leak the port until restart once the listener closes.
 			continue
 		}
 		a.used[port] = true

@@ -186,11 +186,11 @@ func TestMarkExpiredIfBeforeSkipsRenewed(t *testing.T) {
 	if _, err := s.Extend("r", time.Hour); err != nil {
 		t.Fatalf("extend: %v", err)
 	}
-	removed, err := s.MarkExpiredIfBefore("r", cutoff)
+	wasExpired, removed, err := s.MarkExpiredIfBefore("r", cutoff)
 	if err != nil {
 		t.Fatalf("mark: %v", err)
 	}
-	if removed {
+	if wasExpired || removed {
 		t.Fatalf("renewed lease must not be reaped by a stale-cutoff sweep")
 	}
 	if _, ok := s.Get("r"); !ok {

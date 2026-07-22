@@ -118,11 +118,17 @@ func (c *Coordinator) SweepExpired() int {
 	ids := c.store.ExpiredBefore(cutoff)
 	reaped := 0
 	for _, id := range ids {
-		removed, err := c.store.MarkExpiredIfBefore(id, cutoff)
-		if err != nil || !removed {
-			continue // a renewal landed, or already gone — leave it be
+		wasExpired, removed, err := c.store.MarkExpiredIfBefore(id, cutoff)
+		if !wasExpired {
+			continue // renewed since the snapshot — leave it be
 		}
+		// Confirmed expired: stop serving the public listener even if the row
+		// delete failed (a disk/db error must not grant service past the lease).
 		c.manager.Teardown(id)
+		if err != nil || !removed {
+			// Row delete failed; the forward is down, retry the delete next sweep.
+			continue
+		}
 		c.metrics.Reconcile.WithLabelValues("expired").Inc()
 		reaped++
 	}

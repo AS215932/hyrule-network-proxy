@@ -185,6 +185,39 @@ func TestDuplicateForwardFromSameConnRefused(t *testing.T) {
 	}
 }
 
+func TestSecondConnectionTakesOverLease(t *testing.T) {
+	// Last-writer-wins: a second connection for the same lease closes the first,
+	// so a token holder can't accumulate idle sockets.
+	store, addr := testHarness(t)
+	l, _ := store.Create(lease.CreateParams{LeaseID: "takeover", Duration: time.Hour})
+	c1, err := dialClient(t, addr, l.Token)
+	if err != nil {
+		t.Fatalf("dial c1: %v", err)
+	}
+	defer c1.Close()
+
+	c2, err := dialClient(t, addr, l.Token)
+	if err != nil {
+		t.Fatalf("dial c2: %v", err)
+	}
+	defer c2.Close()
+
+	// c1 should have been closed by the takeover; give the server a moment.
+	closed := make(chan struct{})
+	go func() { _ = c1.Wait(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("first connection was not closed by the takeover")
+	}
+	// c2 is the live connection and can still forward.
+	fwd, err := c2.ListenTCP(&net.TCPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("c2 forward: %v", err)
+	}
+	fwd.Close()
+}
+
 func TestForwardAllowsFailsClosed(t *testing.T) {
 	// A lease that requested an allowlist which parsed to zero usable networks
 	// must deny every visitor, never fall open.

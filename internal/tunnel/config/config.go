@@ -102,18 +102,33 @@ func Load() (Config, error) {
 }
 
 // isWildcardAddr reports whether a host:port address binds all interfaces, i.e.
-// the host is empty (":8452"), "0.0.0.0", or "::".
+// the host is empty (":8452"), an unspecified literal ("0.0.0.0"/"::"), or a
+// hostname/alias that RESOLVES to an unspecified address (so an /etc/hosts alias
+// pointing at 0.0.0.0 can't sneak the money path onto every interface).
 func isWildcardAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		// Unparseable — treat as unsafe so a malformed internal addr is rejected.
 		return true
 	}
-	switch host {
-	case "", "0.0.0.0", "::":
+	if host == "" {
 		return true
 	}
-	return net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified()
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsUnspecified()
+	}
+	// Hostname: resolve and reject if any result is unspecified. A transient
+	// lookup failure is not treated as wildcard (production binds literal IPs).
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.IsUnspecified() {
+			return true
+		}
+	}
+	return false
 }
 
 // parsePortRange parses "10000-10499" into inclusive [min, max] bounds.
