@@ -1,0 +1,24 @@
+[Unit]
+Description=Hyrule Tunnel Proxy (public reverse-SSH tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=hyrule-tunnel
+Group=hyrule-tunnel
+EnvironmentFile=/etc/hyrule-tunnel-proxy/env
+ExecStart=/usr/local/bin/hyrule-tunnel-proxy
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hyrule-tunnel-proxy
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hyrule-tunnel-proxy
+
+[Install]
+WantedBy=multi-user.target

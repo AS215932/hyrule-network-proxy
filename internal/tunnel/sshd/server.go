@@ -1,0 +1,297 @@
+// Package sshd implements the public SSH intake for the reverse-tunnel service.
+//
+// Security model: this is the sanctioned public-facing counterpart to the
+// internal-only network-proxy egress sidecar. It accepts ONLY remote port
+// forwarding (ssh -R) and refuses everything an egress proxy would need —
+// direct-tcpip (ssh -L / -D / SOCKS), exec, shell commands, and subsystems.
+// The SSH username is the x402 lease token; there is no password or key auth.
+package sshd
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"time"
+
+	"github.com/AS215932/hyrule-network-proxy/internal/tunnel/lease"
+	"github.com/AS215932/hyrule-network-proxy/internal/tunnel/metrics"
+	gossh "golang.org/x/crypto/ssh"
+)
+
+// LeaseLookup is the subset of the lease store the SSH server needs.
+type LeaseLookup interface {
+	ByToken(token string) (lease.Lease, bool)
+	Get(id string) (lease.Lease, bool)
+}
+
+// Config configures the SSH intake server.
+type Config struct {
+	ListenAddr              string
+	HostKeyPath             string
+	EndpointHost            string
+	SSHPort                 int
+	MaxVisitorConnsPerLease int
+	KeepaliveInterval       time.Duration
+	AuthAttemptsPerWindow   int
+	AuthWindow              time.Duration
+}
+
+// Server is the SSH intake listener.
+type Server struct {
+	cfg     Config
+	signer  gossh.Signer
+	store   LeaseLookup
+	manager *Manager
+	metrics *metrics.Metrics
+	log     *slog.Logger
+	limiter *authLimiter
+}
+
+// New builds an SSH intake server, loading or generating the persistent host key.
+func New(cfg Config, store LeaseLookup, m *metrics.Metrics, log *slog.Logger) (*Server, error) {
+	signer, err := loadOrCreateHostKey(cfg.HostKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		cfg:     cfg,
+		signer:  signer,
+		store:   store,
+		manager: NewManager(store, m, log, cfg.MaxVisitorConnsPerLease),
+		metrics: m,
+		log:     log,
+		limiter: newAuthLimiter(cfg.AuthAttemptsPerWindow, cfg.AuthWindow),
+	}, nil
+}
+
+// Manager exposes the forward manager for lifecycle teardown by the coordinator.
+func (s *Server) Manager() *Manager { return s.manager }
+
+// HostKeyFingerprint returns the server host-key fingerprint for the banner/docs.
+func (s *Server) HostKeyFingerprint() string { return gossh.FingerprintSHA256(s.signer.PublicKey()) }
+
+// serverConfig builds a per-connection SSH server config. Auth succeeds iff the
+// username is a live lease token; "none" and "password" both resolve the same
+// way so rescue clients (which have no key) connect without a prompt.
+func (s *Server) serverConfig() *gossh.ServerConfig {
+	authByToken := func(conn gossh.ConnMetadata) (*gossh.Permissions, error) {
+		l, ok := s.store.ByToken(conn.User())
+		if !ok || l.Expired(time.Now()) {
+			s.metrics.SSHAuthFailures.Inc()
+			return nil, fmt.Errorf("invalid or expired lease token")
+		}
+		return &gossh.Permissions{Extensions: map[string]string{"lease_id": l.LeaseID}}, nil
+	}
+	cfg := &gossh.ServerConfig{
+		NoClientAuth: true,
+		NoClientAuthCallback: func(conn gossh.ConnMetadata) (*gossh.Permissions, error) {
+			return authByToken(conn)
+		},
+		PasswordCallback: func(conn gossh.ConnMetadata, _ []byte) (*gossh.Permissions, error) {
+			return authByToken(conn)
+		},
+		ServerVersion: "SSH-2.0-hyrule-tunnel",
+	}
+	cfg.AddHostKey(s.signer)
+	return cfg
+}
+
+// ListenAndServe binds the intake address and serves until ctx is cancelled.
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(ctx, "tcp", s.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("ssh listen %s: %w", s.cfg.ListenAddr, err)
+	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve accepts SSH intake connections on ln until ctx is cancelled. Exposed so
+// tests can bind their own listener and learn its port.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	s.log.Info("ssh_intake_listening", "addr", ln.Addr().String(), "fingerprint", s.HostKeyFingerprint())
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				s.log.Warn("ssh_accept_error", "error", err.Error())
+				continue
+			}
+		}
+		host := remoteIP(conn.RemoteAddr())
+		if !s.limiter.allow(host) {
+			s.metrics.SSHAuthFailures.Inc()
+			_ = conn.Close()
+			continue
+		}
+		go s.handleConn(ctx, conn)
+	}
+}
+
+// handleConn runs the SSH handshake and, on success, wires reverse forwarding.
+func (s *Server) handleConn(ctx context.Context, raw net.Conn) {
+	_ = raw.SetDeadline(time.Now().Add(30 * time.Second)) // handshake deadline
+	sconn, chans, reqs, err := gossh.NewServerConn(raw, s.serverConfig())
+	if err != nil {
+		_ = raw.Close()
+		return
+	}
+	_ = raw.SetDeadline(time.Time{}) // clear; keepalives govern liveness now
+
+	leaseID := sconn.Permissions.Extensions["lease_id"]
+	l, ok := s.store.Get(leaseID)
+	if !ok || l.Expired(time.Now()) {
+		_ = sconn.Close()
+		return
+	}
+	s.metrics.SSHConnections.WithLabelValues("connected").Inc()
+	defer s.metrics.SSHConnections.WithLabelValues("connected").Dec()
+	s.log.Info("ssh_client_connected", "lease_id", leaseID, "port", l.AllocatedPort)
+
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go s.keepalive(connCtx, sconn)
+	go s.rejectChannels(chans)
+
+	s.handleGlobalRequests(sconn, reqs, l)
+
+	// Connection closed: tear down its forward only if it still owns it (a newer
+	// reconnect may already have replaced it).
+	s.manager.OnConnClosed(leaseID, sconn)
+	_ = sconn.Close()
+	s.log.Info("ssh_client_disconnected", "lease_id", leaseID)
+}
+
+// handleGlobalRequests services tcpip-forward / cancel-tcpip-forward and drops
+// everything else. It returns when the request channel closes (conn shutdown).
+func (s *Server) handleGlobalRequests(sconn *gossh.ServerConn, reqs <-chan *gossh.Request, l lease.Lease) {
+	for req := range reqs {
+		switch req.Type {
+		case "tcpip-forward":
+			var m struct {
+				Addr string
+				Port uint32
+			}
+			if err := gossh.Unmarshal(req.Payload, &m); err != nil {
+				replyRequest(req, false, nil)
+				continue
+			}
+			// Ignore the client's requested port; always bind the lease's
+			// allocated port. Echo the client's requested bind in the eventual
+			// forwarded-tcpip channel so OpenSSH's permit-open check matches:
+			// for a dynamic (port 0) request that is the port we assign.
+			connectedPort := m.Port
+			if m.Port == 0 {
+				connectedPort = uint32(l.AllocatedPort)
+			}
+			if err := s.manager.StartForward(sconn, l, m.Addr, connectedPort); err != nil {
+				s.log.Warn("forward_start_failed", "lease_id", l.LeaseID, "error", err.Error())
+				replyRequest(req, false, nil)
+				continue
+			}
+			if req.WantReply {
+				if m.Port == 0 {
+					_ = req.Reply(true, gossh.Marshal(struct{ Port uint32 }{uint32(l.AllocatedPort)}))
+				} else {
+					_ = req.Reply(true, nil)
+				}
+			}
+		case "cancel-tcpip-forward":
+			s.manager.Teardown(l.LeaseID)
+			replyRequest(req, true, nil)
+		default:
+			// keepalive@openssh.com and anything unexpected: decline.
+			replyRequest(req, false, nil)
+		}
+	}
+}
+
+// rejectChannels refuses every channel type. Reverse forwarding needs no client
+// channel; a "session" is refused (no shell) and "direct-tcpip" (ssh -L / SOCKS)
+// is the abuse vector this service exists to deny.
+func (s *Server) rejectChannels(chans <-chan gossh.NewChannel) {
+	for newChan := range chans {
+		_ = newChan.Reject(gossh.Prohibited, "hyrule-tunnel accepts only remote (-R) port forwarding")
+	}
+}
+
+// keepalive sends periodic keepalives and closes the connection after three
+// consecutive failures, so dead NAT bindings are reaped.
+func (s *Server) keepalive(ctx context.Context, sconn *gossh.ServerConn) {
+	if s.cfg.KeepaliveInterval <= 0 {
+		return
+	}
+	t := time.NewTicker(s.cfg.KeepaliveInterval)
+	defer t.Stop()
+	misses := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_, _, err := sconn.SendRequest("keepalive@openssh.com", true, nil)
+			if err != nil {
+				misses++
+				if misses >= 3 {
+					_ = sconn.Close()
+					return
+				}
+				continue
+			}
+			misses = 0
+		}
+	}
+}
+
+func replyRequest(req *gossh.Request, ok bool, payload []byte) {
+	if req.WantReply {
+		_ = req.Reply(ok, payload)
+	}
+}
+
+func remoteIP(addr net.Addr) string {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
+// loadOrCreateHostKey reads an ed25519 host key from path, generating and
+// persisting one (0600) on first run so the fingerprint is stable across
+// restarts.
+func loadOrCreateHostKey(path string) (gossh.Signer, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		signer, err := gossh.ParsePrivateKey(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse host key %s: %w", path, err)
+		}
+		return signer, nil
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		return nil, fmt.Errorf("persist host key %s: %w", path, err)
+	}
+	return gossh.ParsePrivateKey(pemBytes)
+}
