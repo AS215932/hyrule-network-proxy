@@ -34,11 +34,13 @@ type forward struct {
 	allowlistSet  bool         // a restriction was requested for this lease
 	closeOnce     sync.Once
 
-	// Active visitor sockets, closed on teardown so a blocked visitor→channel
-	// copy unblocks (otherwise wg.Wait and the visitor-count decrement never run
-	// and descriptors leak).
+	// Active visitor sockets mapped to their forwarded SSH channel (nil until
+	// opened). Teardown closes BOTH: closing the visitor socket unblocks the copy
+	// reading it, and closing the SSH channel unblocks the copy reading the
+	// channel — otherwise wg.Wait and the visitor-count decrement never run and
+	// descriptors leak.
 	vmu      sync.Mutex
-	visitors map[net.Conn]struct{}
+	visitors map[net.Conn]gossh.Channel
 	closed   bool
 }
 
@@ -62,8 +64,11 @@ func (f *forward) close() {
 		_ = f.listener.Close()
 		f.vmu.Lock()
 		f.closed = true
-		for vc := range f.visitors {
+		for vc, ch := range f.visitors {
 			_ = vc.Close()
+			if ch != nil {
+				_ = ch.Close()
+			}
 		}
 		f.visitors = nil
 		f.vmu.Unlock()
@@ -79,9 +84,25 @@ func (f *forward) trackVisitor(vc net.Conn) bool {
 		return false
 	}
 	if f.visitors == nil {
-		f.visitors = make(map[net.Conn]struct{})
+		f.visitors = make(map[net.Conn]gossh.Channel)
 	}
-	f.visitors[vc] = struct{}{}
+	f.visitors[vc] = nil
+	return true
+}
+
+// setVisitorChannel records the SSH channel for a tracked visitor so teardown
+// can close it. Returns false if the forward was closed in the meantime (the
+// caller should close ch itself and abort).
+func (f *forward) setVisitorChannel(vc net.Conn, ch gossh.Channel) bool {
+	f.vmu.Lock()
+	defer f.vmu.Unlock()
+	if f.closed {
+		return false
+	}
+	if _, ok := f.visitors[vc]; !ok {
+		return false
+	}
+	f.visitors[vc] = ch
 	return true
 }
 
@@ -381,6 +402,11 @@ func (m *Manager) handleVisitor(st *leaseState, f *forward, vc net.Conn) {
 		return
 	}
 	defer ch.Close()
+	// Record the channel so teardown closes it too — otherwise a copy blocked
+	// READING the channel (client idle) never returns when only vc is closed.
+	if !f.setVisitorChannel(vc, ch) {
+		return // forward torn down while we were opening the channel
+	}
 	go gossh.DiscardRequests(reqs)
 
 	// Bidirectional copy. "in" = visitor→client, "out" = client→visitor.

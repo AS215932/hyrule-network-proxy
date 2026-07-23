@@ -106,6 +106,14 @@ func Open(dbPath string, minPort, maxPort int) (*Store, error) {
 				stale = append(stale, append([]byte(nil), k...))
 				return nil
 			}
+			// Prune a lease whose port is now outside the configured range (the
+			// range was narrowed/moved since it was minted): binding it would
+			// listen outside the public firewall range or advertise an
+			// unreachable port. Drop it rather than retain it as active.
+			if l.AllocatedPort < minPort || l.AllocatedPort > maxPort {
+				stale = append(stale, append([]byte(nil), k...))
+				return nil
+			}
 			cp := l
 			s.byID[l.LeaseID] = &cp
 			s.byToken[l.Token] = &cp

@@ -24,7 +24,7 @@ func TestLoadRequiresAuthToken(t *testing.T) {
 }
 
 func TestLoadDefaults(t *testing.T) {
-	t.Setenv("HTP_AUTH_TOKEN", "x")
+	t.Setenv("HTP_AUTH_TOKEN", "0123456789abcdef0123456789abcdef")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -38,15 +38,24 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadRejectsBadPortRange(t *testing.T) {
-	t.Setenv("HTP_AUTH_TOKEN", "x")
+	t.Setenv("HTP_AUTH_TOKEN", "0123456789abcdef0123456789abcdef")
 	t.Setenv("HTP_DATA_PORT_RANGE", "nonsense")
 	if _, err := Load(); err == nil {
 		t.Fatalf("expected error for bad port range")
 	}
 }
 
+func TestLoadRejectsWeakToken(t *testing.T) {
+	for _, weak := range []string{"x", "change-me", "short-token-under-32-chars"} {
+		t.Setenv("HTP_AUTH_TOKEN", weak)
+		if _, err := Load(); err == nil {
+			t.Fatalf("expected error for weak token %q", weak)
+		}
+	}
+}
+
 func TestIsWildcardAddr(t *testing.T) {
-	for _, w := range []string{":8452", "0.0.0.0:8452", "[::]:8452", "garbage"} {
+	for _, w := range []string{":8452", "0.0.0.0:8452", "[::]:8452", "[::%lo]:8452", "garbage"} {
 		if !isWildcardAddr(w) {
 			t.Fatalf("expected %q to be wildcard/unsafe", w)
 		}
@@ -59,7 +68,7 @@ func TestIsWildcardAddr(t *testing.T) {
 }
 
 func TestLoadRejectsWildcardControlAndMetrics(t *testing.T) {
-	t.Setenv("HTP_AUTH_TOKEN", "x")
+	t.Setenv("HTP_AUTH_TOKEN", "0123456789abcdef0123456789abcdef")
 	t.Setenv("HTP_CONTROL_LISTEN_ADDR", "[::]:8452")
 	if _, err := Load(); err == nil {
 		t.Fatalf("expected error for wildcard control listener")

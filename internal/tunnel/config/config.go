@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -76,6 +77,12 @@ func Load() (Config, error) {
 	if cfg.AuthToken == "" {
 		return cfg, fmt.Errorf("HTP_AUTH_TOKEN is required")
 	}
+	// The control bearer is the sole credential for the lease-management money
+	// path; reject weak/placeholder values so a copied default can't mint,
+	// extend, or revoke leases.
+	if len(cfg.AuthToken) < 32 || cfg.AuthToken == "change-me" {
+		return cfg, fmt.Errorf("HTP_AUTH_TOKEN must be at least 32 characters and not the placeholder")
+	}
 	if cfg.EndpointHost == "" {
 		return cfg, fmt.Errorf("HTP_ENDPOINT_HOST is required")
 	}
@@ -114,7 +121,13 @@ func isWildcardAddr(addr string) bool {
 	if host == "" {
 		return true
 	}
-	if ip := net.ParseIP(host); ip != nil {
+	// Strip an IPv6 zone (e.g. "::%lo") before parsing: net.Listen drops the
+	// zone and binds the base address, so "[::%lo]:8452" would wildcard-bind.
+	base := host
+	if i := strings.IndexByte(base, '%'); i >= 0 {
+		base = base[:i]
+	}
+	if ip := net.ParseIP(base); ip != nil {
 		return ip.IsUnspecified()
 	}
 	// Hostname: resolve and reject if any result is unspecified. A transient
