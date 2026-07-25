@@ -81,6 +81,25 @@ func TestRedirectPolicyOnRealClientBlocksRedirectToPrivateTarget(t *testing.T) {
 	}
 }
 
+func TestRedirectPolicyOnRealClientBlocksRedirectToOnion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://example.onion/blocked", http.StatusFound)
+	}))
+	defer server.Close()
+
+	client := &http.Client{
+		CheckRedirect: RedirectPolicy(contract.ProxyModeDirect, 3, DefaultResolver),
+	}
+
+	resp, err := client.Get(server.URL)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("expected the real http.Client to refuse a direct-mode redirect onto a .onion name")
+	}
+}
+
 func TestRedirectPolicyOnRealClientAllowsRedirectToPublicTarget(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/final" {
