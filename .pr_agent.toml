@@ -1,0 +1,52 @@
+# PR-Agent (advisory) configuration for AS215932/hyrule-network-proxy.
+# Runs only on the unprivileged hyrule-public-pr runner with read/comment-only
+# perms, on our OpenRouter key. See the network-operations docs/ci/pr-agent.md
+# for the full design.
+
+[config]
+git_provider = "github"
+# deepseek-v4-flash / minimax-m2.7 are not in PR-Agent's built-in model list,
+# so they are custom models — custom_model_max_tokens is required.
+model = "openrouter/deepseek/deepseek-v4-flash"
+fallback_models = ["openrouter/minimax/minimax-m2.7"]
+custom_model_max_tokens = 128000
+temperature = 0.2
+use_repo_settings_file = true
+publish_output = true
+
+[github_action_config]
+auto_review = true
+auto_describe = false
+auto_improve = true
+
+[pr_reviewer]
+require_security_review = true
+require_tests_review = true
+require_score_review = true
+require_estimate_effort_to_review = true
+extra_instructions = """
+This is hyrule-network-proxy: an internal Go sidecar (see AGENTS.md) that
+executes already-authorized outbound network requests on Hyrule Cloud's
+behalf, plus (in later work) a reverse-SSH tunnel daemon. Both binaries only
+ever act on requests Hyrule Cloud has already x402-verified — this repo is
+never internet-facing on its own. HIGH RISK areas, flag with specifics:
+- weakening the SSRF dial guard (private/reserved/loopback/link-local block,
+  redirect-policy revalidation on every hop, direct-to-.onion block);
+- CONNECT tunneling, arbitrary TCP/SOCKS proxying, or residential-proxy
+  support added without an explicit design review (AGENTS.md forbids this
+  for the egress sidecar);
+- for the tunnel daemon: anything that widens SSH intake beyond remote (-R)
+  forwarding — direct-tcpip (-L/-D/SOCKS), exec, shell, or subsystem channels
+  must stay refused; this is the whole reason it is a separate binary from
+  the egress sidecar;
+- the internal control API (`/v1/*`) becoming reachable on a non-loopback/
+  non-internal bind, or missing its bearer-token check;
+- logging request/response bodies, payment headers, Authorization headers,
+  cookies, or bearer/control tokens;
+- missing tests around the abuse-control guards (dial policy, SSH channel
+  allowlist, lease store idempotency).
+Do not restate the diff; surface risk, missing tests, and operational footguns.
+"""
+
+[pr_description]
+publish_description_as_comment = true
