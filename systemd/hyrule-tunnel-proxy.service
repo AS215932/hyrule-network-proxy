@@ -1,0 +1,28 @@
+[Unit]
+Description=Hyrule Tunnel Proxy (public reverse-SSH tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=hyrule-tunnel
+Group=hyrule-tunnel
+EnvironmentFile=/etc/hyrule-tunnel-proxy/env
+ExecStart=/usr/local/bin/hyrule-tunnel-proxy
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# systemd creates /var/lib/hyrule-tunnel-proxy owned by the service user before
+# the sandboxed (non-root, ProtectSystem=strict) process starts, and adds it to
+# the writable paths — so a fresh install has a writable state dir.
+StateDirectory=hyrule-tunnel-proxy
+StateDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hyrule-tunnel-proxy
+
+[Install]
+WantedBy=multi-user.target
