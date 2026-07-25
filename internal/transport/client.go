@@ -129,6 +129,13 @@ func (c *Client) Do(ctx context.Context, in contract.NetworkRequest) contract.Ne
 	}
 	defer resp.Body.Close()
 
+	return c.buildResponse(resp, mode, start)
+}
+
+// buildResponse reads a bounded amount of the upstream response body, applies
+// the response header denylist, and marks truncation. It never returns the
+// denied headers (auth/cookie/payment) to the caller.
+func (c *Client) buildResponse(resp *http.Response, mode string, start time.Time) contract.NetworkResponse {
 	limited := io.LimitReader(resp.Body, c.cfg.MaxResponseBodyBytes+1)
 	respBytes, err := io.ReadAll(limited)
 	if err != nil {
